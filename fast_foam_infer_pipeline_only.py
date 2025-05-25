@@ -1,15 +1,12 @@
-# this version  is for the paper evaluation of the performance, 
-# input can either be tiff file or h5 file, tested with 1024 and 4096 synthetic cases
-# output is the log file with the timing results
+# this version if for pipeline only, no optimization for the shared memory part
 
 import torch, argparse, os, time, sys, shutil, logging
 
+
 from model import unet
-
-from data_cube_dist import TomoInferDatasetFoam3DCube_h5, TomoInferDatasetFoam3DCube_tiff
-
+from data_cube import TomoInferDatasetFoam3DCube_h5, TomoInferDatasetFoam3DCube_tiff
 import numpy as np
-from torch.utils.data import DataLoader, DistributedSampler
+from torch.utils.data import DataLoader
 from matplotlib import pyplot as plt
 import tifffile
 import pandas as pd
@@ -18,19 +15,17 @@ from utils import save2img
 from skimage.metrics import structural_similarity as ssim
 from skimage.metrics import peak_signal_noise_ratio as psnr
 
+
 import torch.multiprocessing as mp  # for multiple processing
 from torch.utils.data import Subset 
 import subprocess
 import concurrent.futures
-from multiprocessing import shared_memory, Process # for shared memory across processes 
-
 
 def async_pipeline_postprocess(
     output,
     temp_X_buffer, temp_Y_buffer,
-    shared_name, shape, dtype, 
-    rank, num_processes, gts, idx, 
-    barrier, mbsz, num_cubes_per_rank,  
+    rank, preds, gts,
+    barrier,
     timers: dict
 ):
     """Performs buffer write, barrier wait, and accumulation with timing."""
@@ -39,6 +34,11 @@ def async_pipeline_postprocess(
     # torch.cuda.synchronize()
     start_time = time.perf_counter()
 
+    # print(output.squeeze(dim=1).numpy()[0][0][0][0])
+
+    temp_X_buffer[rank] = output.squeeze(dim=1).numpy()
+    # temp_Y_buffer[rank] = y.squeeze(dim=1)
+
     # torch.cuda.synchronize()
     timers["unsq_time_time"] += time.perf_counter() - start_time
 
@@ -46,24 +46,22 @@ def async_pipeline_postprocess(
     # torch.cuda.synchronize()
     start_time = time.perf_counter()
 
+    barrier.wait()
+
+    # torch.cuda.synchronize()
     timers["barrier_wait_time"] += time.perf_counter() - start_time
 
+    # Local accumulation (on rank 0)
+    # torch.cuda.synchronize()
     start_time = time.perf_counter()
 
-    # pushed to the global shared memory instead of local list, 
-    # the goal is to avoid later concatenation
-    list_of_cubes = list(output.squeeze(dim=1).numpy())
+    if rank == 0:
+        preds.append(temp_X_buffer)
+        # gts.append(temp_Y_buffer)
 
-    shm = shared_memory.SharedMemory(name=shared_name)
-    arr = np.ndarray(shape, dtype=dtype, buffer=shm.buf)
-    for i in range(mbsz):
-        arr[rank*num_cubes_per_rank + idx*mbsz + i] = list_of_cubes[i]
-    shm.close()
-
+    # torch.cuda.synchronize()
     timers["local_buffer_time"] += time.perf_counter() - start_time
 
-# this function is still in developing phases, 
-# used to copy testing dataset from NFS to local disk, then reduce data reading time
 def stage_file(src_file, dst_file=None):
     if dst_file is None:
         dst_dir = f"/tmp/{os.environ['USER']}/staged_files"
@@ -80,10 +78,10 @@ def stage_file(src_file, dst_file=None):
 
     return dst_file
 
-# this function was used to do cyclic distribution of the data during the loading phase
 def get_cyclic_subset(dataset, rank, world_size):
     indices = list(range(rank, len(dataset), world_size))
     return Subset(dataset, indices)
+
 
 def count_parameters(model):
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -127,61 +125,8 @@ def mem_estimator(args, model):
     return peak_memory_mb1*ratio_cubic*ratio_batch
 
 
-def evaluation(args, gts, preds, odir):
-    ssim_vals, psnr_vals, rmse_vals = [], [], []
-    #Calculate Test Metrics
-    for i in range(gts.shape[0]):
-        #SSIM Calc
-        img1 = preds[i]
-        img1 = (img1-img1.min()) / (img1.max()-img1.min()+1e-7)
-        img2 = gts[i]
-        img2 = (img2-img2.min()) / (img2.max()-img2.min()+1e-7)
-
-        #Crop out region outside sample
-        #l_x, l_y = img2.shape[0], img2.shape[1]
-        #X, Y = np.ogrid[:l_x, :l_y]
-        #outer_disk_mask = (X - l_x / 2) ** 2 + (Y - l_y / 2) ** 2 > (l_x / 2) ** 2
-        #[~outer_disk_mask]
-
-        dr = img2.max() - img2.min()
-        ssim_vals.append(ssim(img1, img2, data_range=dr))
-
-        #PSNR Calc
-        dr = img2.max() - img2.min()+1e-7
-        psnr_vals.append(psnr(img1, img2, data_range=dr))
-
-        #RMSE Calc
-        rmse = np.sqrt(((img1-img2)**2.).mean())
-        rmse_vals.append(rmse)
-
-        #Save a single image (runs faster)
-        if i == 525:
-            save2img(img1, f'{odir}/tiffs/pred/{i:05d}.tiff')
-
-        #Save output
-        #save2img(img1, f'{odir}/tiffs/pred/{i:05d}.tiff')
-        #save2img(img2, f'{odir}/tiffs/gt/{i:05d}.tiff')
-        #save2img(img1, f'{odir}/pngs/pred/{i:05d}.png')
-        #save2img(img2, f'{odir}/pngs/gt/{i:05d}.png')
-
-
-    ssim_vals = np.array(ssim_vals)
-    psnr_vals = np.array(psnr_vals)
-    rmse_vals = np.array(rmse_vals)
-
-    out_path = '/home/beams/WZHENG/3DN2I/CSVs/3D'
-    dosage_level = '50A_500I_Cube'
-    
-    results_df = pd.DataFrame({
-        'SSIM': ssim_vals,
-        'PSNR': psnr_vals,
-        'RMSE': rmse_vals,
-    })
-
-    return results_df
-
 # mains inference function
-def inference(args, model, odir, shared_name, shape, dtype, rank, num_processes, num_cubes_per_rank, gts, temp_X_buffer, temp_Y_buffer, barrier):
+def inference(args, model, odir, rank, num_processes, preds, gts, temp_X_buffer, temp_Y_buffer, barrier):
 
     total_time = 0
 
@@ -202,33 +147,23 @@ def inference(args, model, odir, shared_name, shape, dtype, rank, num_processes,
     logging.info(f"\nFolder creating time is: {time.time()-start_time:.4f} seconds\n")
     logging.info(f"\nInference function Time now is: {total_time:.4f} seconds\n")
 
-    # add a staging function to copy the data to a local tmp directory
-    start_time = time.time()
-    if args.staging:
-        stage_file(args.ih5, args.staged_path)
-    total_time += time.time() - start_time
-    logging.info(f"\nData staging time is: {time.time()-start_time:.4f} seconds\n")
-    logging.info(f"\nInference function Time now is: {total_time:.4f} seconds\n")
-
-    
     # create the dataset according to the rank 
     start_time = time.time()
-    if args.staging:
-        ds_test = TomoInferDatasetFoam3DCube_h5(ih5=args.staged_path, cube_size=args.cube_size, rank=rank, world_size=num_processes)
-    elif args.ih5 != 'false':
-        ds_test = TomoInferDatasetFoam3DCube_h5(ih5=args.ih5, cube_size=args.cube_size, rank=rank, world_size=num_processes)
+    if args.ih5 != 'false':
+        ds_test = TomoInferDatasetFoam3DCube_h5(ih5=args.ih5, cube_size=args.cube_size)
     else:
-        ds_test = TomoInferDatasetFoam3DCube_tiff(path_to_tiffs_dir=args.tiff_dir, cube_size=args.cube_size, mean=args.s0_mean, std=args.s0_std, rank=rank, world_size=num_processes)
+        ds_test = TomoInferDatasetFoam3DCube_tiff(path_to_tiffs_dir=args.tiff_dir, cube_size=args.cube_size, mean=args.s0_mean, std=args.s0_std)
     
     total_time += time.time() - start_time
     logging.info(f"\nData load Time phase 0: {time.time()-start_time:.4f} seconds\n")
     logging.info(f"\nInference function Time now is: {total_time:.4f} seconds\n")
 
+
     start_time = time.time()
-    dl_test = DataLoader(dataset=ds_test, batch_size=args.mbsz, shuffle=False, num_workers=args.num_workers, drop_last=False, pin_memory=True)
+    dl_test = DataLoader(dataset=ds_test, batch_size=args.mbsz, shuffle=False, num_workers=0, drop_last=False, pin_memory=True)
     total_time += time.time() - start_time
     logging.info(f"\nData load Time phase 1: {time.time()-start_time:.4f} seconds\n")
-    logging.info(f"\nTInference function Time now is: {total_time:.4f} seconds\n")
+    logging.info(f"\nInference function Time now is: {total_time:.4f} seconds\n")
     
     start_time = time.perf_counter()
 
@@ -251,7 +186,7 @@ def inference(args, model, odir, shared_name, shape, dtype, rank, num_processes,
     # Example: adjust the dimensions to match your actual input
     start_time = time.perf_counter()
 
-    # mem_size = mem_estimator(args, model)
+    # mem_estimator(args, model)
 
     torch.cuda.synchronize()
     elapsed_time = time.perf_counter() - start_time
@@ -281,9 +216,7 @@ def inference(args, model, odir, shared_name, shape, dtype, rank, num_processes,
 
         torch.cuda.synchronize()
         start_time = time.perf_counter()
-        # two worker threads here, one for pre processing, one for post processing
         executor = concurrent.futures.ThreadPoolExecutor(max_workers=2)
-        # here just went 2 unrolling steps, tested already work well 
         data_iter = iter(dl_test)
         current_batch = next(data_iter)
         next_batch_future = executor.submit(next, data_iter)
@@ -310,6 +243,11 @@ def inference(args, model, odir, shared_name, shape, dtype, rank, num_processes,
             data_loading_time += time.perf_counter() - start_time
 
             skip_start = time.perf_counter()
+
+            if idx % num_processes != rank:
+                torch.cuda.synchronize()
+                skipped_time += time.perf_counter() - skip_start
+                continue
 
             skipped_time += time.perf_counter() - skip_start
 
@@ -352,15 +290,13 @@ def inference(args, model, odir, shared_name, shape, dtype, rank, num_processes,
             # Ensure it finishes before reuse or shutdown
             if postprocess_future is not None:
                 postprocess_future.result()
-   
-            # the input idx will be used to compute the index of the output
+
             postprocess_future = executor.submit(
                 async_pipeline_postprocess,
                 output,
                 temp_X_buffer, temp_Y_buffer,
-                shared_name, shape, dtype, 
-                rank, num_processes, gts, idx, 
-                barrier, args.mbsz, num_cubes_per_rank,
+                rank, preds, gts,
+                barrier,
                 timers
             )
 
@@ -400,32 +336,31 @@ def inference(args, model, odir, shared_name, shape, dtype, rank, num_processes,
         logging.info(f"[Total Accounted Time]       : {total_time:.4f} seconds")
         logging.info(f"[Skipped Time]               : {skipped_time:.4f} seconds (if measured)")
         logging.info(f"[# Cubes Processed by Rank]  : {cube_index}")
+
         
     if rank == 0:
         start_time = time.time()
-
-        shm = shared_memory.SharedMemory(name=shared_name)
-        arr = np.ndarray(shape, dtype=dtype, buffer=shm.buf)
-
-        preds_result = arr
-        logging.info(f"\nResults copy Time: {time.time()-start_time:.4f} seconds\n")
+        preds = np.concatenate(preds, axis=0)
+        # gts = np.concatenate(gts, axis=0)
         total_time += time.time() - start_time
+        logging.info(f"\nConcatenate Time: {time.time()-start_time:.4f} seconds\n")
         logging.info(f"\nInference function Time now is: {total_time:.4f} seconds\n")
 
-        # logging.info(f'\nOutput Shape: {preds.shape}')
 
         start_time = time.time()
-        preds_result = ds_test.stitch(preds_result)
-        logging.info(f"\nStitch Time: {time.time()-start_time:.4f} seconds\n")
+        preds = ds_test.stitch(preds)
+        # gts = ds_test.stitch(gts)
         total_time += time.time() - start_time
+        logging.info(f"\nStitch Time: {time.time()-start_time:.4f} seconds\n")
         logging.info(f"\nInference function Time now is: {total_time:.4f} seconds\n")
+
+        # logging.info(f'\nStitched output Shape: {preds.shape}')
  
     if rank == 0:
         start_time = time.time()
-        # results_df = evaluation(args, gts_result, preds_result, odir)  
+        # results_df = evaluation(args, gts, preds, odir)  
         # logging.info(results_df.describe())
-        # results_df.to_csv(f'{out_path}/{dosage_level}_test_results_cubify.csv', columns=results_df.columns, index=False)
-        shm.close()
+        #results_df.to_csv(f'{out_path}/{dosage_level}_test_results_cubify.csv', columns=results_df.columns, index=False)
         total_time += time.time() - start_time
         logging.info(f"\nEvaluation Time: {time.time()-start_time:.4f} seconds\n")
         logging.info(f"\nInference function Time now is: {total_time:.4f} seconds\n")
@@ -433,7 +368,7 @@ def inference(args, model, odir, shared_name, shape, dtype, rank, num_processes,
     logging.info(f"\nTotal inference Time: {total_time:.4f} seconds\n")
 
 
-def main(args, shared_name, shape, dtype, rank, num_processes, num_cubes_per_rank, gts, temp_X_buffer, temp_Y_buffer, barrier):
+def main(args, rank, num_processes, preds, gts, temp_X_buffer, temp_Y_buffer, barrier):
 
     total_time = 0
     init_time = time.time()
@@ -462,7 +397,7 @@ def main(args, shared_name, shape, dtype, rank, num_processes, num_cubes_per_ran
     model = unet(start_filter_size=8)
     total_time += time.time() - start_time
     logging.info(f"\nModel load Phase 1 Time: {time.time()-start_time:.4f} seconds\n")
-    logging.info(f"Number of model parameters: {count_parameters(model):,}")
+    print(f"Number of model parameters: {count_parameters(model):,}")
 
     start_time = time.time()
     model.load_state_dict(checkpoint['model_state_dict'])
@@ -470,13 +405,13 @@ def main(args, shared_name, shape, dtype, rank, num_processes, num_cubes_per_ran
     logging.info(f"\nModel load Phase 2 Time: {time.time()-start_time:.4f} seconds\n")
 
     start_time = time.time()
-    inference(args, model, itr_out_dir, shared_name, shape, dtype, rank, num_processes, num_cubes_per_rank, gts, temp_X_buffer, temp_Y_buffer, barrier)
+    inference(args, model, itr_out_dir, rank, num_processes, preds, gts, temp_X_buffer, temp_Y_buffer, barrier)
     total_time += time.time() - start_time
     logging.info(f"\nInference Function Time: {time.time()-start_time:.4f} seconds\n")
 
     inference_time = time.time() - init_time
     logging.info(f"\nTotal Time: {total_time:.4f} seconds\n")
-    logging.info(f"\nWall clock Time is: {inference_time:.4f} seconds\n")
+    logging.info(f"\nWall clock Time: {inference_time:.4f} seconds\n")
 
 
 if __name__ == '__main__':
@@ -512,7 +447,7 @@ if __name__ == '__main__':
     parser.add_argument('-mdl',type=str, default=mdl, help='model path')
     parser.add_argument('-num_workers',type=int, default=0, help='number of workers to load data, default set to 0 since we have pipelined execution')
 
-    parser.add_argument('-input_size',type=int, help='inference input size')
+    # parser.add_argument('-input_size',type=int, default=1024, help='inference input size')
     parser.add_argument('-cube_size',type=int, default=128, help='inference cube size')
     parser.add_argument('-mbsz',type=int, default=8, help='inference batch size')
 
@@ -521,7 +456,6 @@ if __name__ == '__main__':
     # parameters for the tff version
     parser.add_argument('-s0_mean',type=int, default=s0_mean, help='split 0 mean')
     parser.add_argument('-s0_std',type=int, default=s0_std, help='split 0 std')
-    
 
     args, unparsed = parser.parse_known_args()
 
@@ -533,6 +467,9 @@ if __name__ == '__main__':
     if os.path.isdir(itr_out_dir): 
         shutil.rmtree(itr_out_dir)
     os.mkdir(itr_out_dir) # to save temp output
+
+    # logging.basicConfig(filename=os.path.join(itr_out_dir, f'TomoGAN_Inference_b{args.mbsz}.log'), level=logging.DEBUG,\
+    #                     format='%(asctime)s %(levelname)s %(module)s: %(message)s')
     
     logging.getLogger('matplotlib.font_manager').disabled = True
     logging.getLogger('matplotlib').setLevel(level=logging.CRITICAL)
@@ -549,16 +486,10 @@ if __name__ == '__main__':
 
     start_time = time.time()
 
-    # create preds and gts, preds_shared to share across devices
+    # create preds and gts to share across devices
     manager = mp.Manager()
-
-    list_size  = int(args.input_size / args.cube_size) 
-    list_size  = int(list_size * list_size * list_size)
-
-    print(f'number of element for the output is {list_size}')
-
-    num_cubes_per_rank = int(list_size / num_processes)
-    gts = manager.list([None] * list_size)
+    preds = manager.list()
+    gts = manager.list()
 
     # two empty lists that are used to collect all processes' results during forward
     temp_X_buffer = manager.list([None] * num_processes)
@@ -567,28 +498,15 @@ if __name__ == '__main__':
     # barrier used to keep track of all processes to finish the inference job
     barrier = mp.Barrier(num_processes)
 
-    # following is to create a shared memory block for all processes, to avoid the shared list
-    shape = (list_size, args.cube_size, args.cube_size, args.cube_size)
-    dtype = np.float32
-
-    # 1) create and zero‐init a shared block
-    shm = shared_memory.SharedMemory(create=True,
-                                    size=np.prod(shape)*np.dtype(dtype).itemsize)
-    preds_shared = np.ndarray(shape, dtype=dtype, buffer=shm.buf)
-    preds_shared[:] = 0
-
     # Spawn processes
     for rank in range(num_processes):
-        p = mp.Process(target=main, args=(args, shm.name, shape, dtype, rank, num_processes, num_cubes_per_rank, gts, temp_X_buffer, temp_Y_buffer, barrier))
+        p = mp.Process(target=main, args=(args, rank, num_processes, preds, gts, temp_X_buffer, temp_Y_buffer, barrier))
         p.start()
         processes.append(p)
 
     # Join processes
     for p in processes:
         p.join()
-
-    shm.close()
-    shm.unlink()
 
     inference_time = time.time() - start_time
     logging.info(f"\nWall clock Time: {inference_time:.4f} seconds\n")

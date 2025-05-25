@@ -14,105 +14,15 @@ from utils import save2img
 from skimage.metrics import structural_similarity as ssim
 from skimage.metrics import peak_signal_noise_ratio as psnr
 
-
 import torch.multiprocessing as mp  # for multiple processing
+# from torch.utils.data import Subset 
 
+# def get_cyclic_subset(dataset, rank, world_size):
+#     indices = list(range(rank, len(dataset), world_size))
+#     return Subset(dataset, indices)
 
 def count_parameters(model):
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
-
-
-# used to estimate the memory usage for the specific batch size, 
-# TODO: create a batch size predictor
-def mem_estimator(args, model):
-    dummy_input1 = torch.randn(1, 1, 64, 64, 64).cuda()  # Modify as needed
-    # Reset peak memory stats
-    torch.cuda.reset_peak_memory_stats()
-    with torch.no_grad():
-        _ = model(dummy_input1)
-        peak_memory_bytes = torch.cuda.max_memory_allocated()
-        peak_memory_mb1 = peak_memory_bytes / (1024 ** 2)
-    logging.info(f"Peak GPU memory usage during dummy 1 inference: {peak_memory_mb1:.2f} MB")
-    
-    dummy_input2 = torch.randn(1, 1, 128, 128, 128).cuda()
-    torch.cuda.reset_peak_memory_stats()
-    with torch.no_grad():
-        _ = model(dummy_input2)
-        peak_memory_mb2 = torch.cuda.max_memory_allocated() / (1024 ** 2)
-    logging.info(f"Peak GPU memory usage during dummy 2 inference: {peak_memory_mb2:.2f} MB")
-
-    dummy_input3 = torch.randn(2, 1, 64, 64, 64).cuda()
-    torch.cuda.reset_peak_memory_stats()
-    with torch.no_grad():
-        _ = model(dummy_input3)
-        peak_memory_mb3 = torch.cuda.max_memory_allocated() / (1024 ** 2)
-    logging.info(f"Peak GPU memory usage during dummy 3 inference: {peak_memory_mb3:.2f} MB")
-
-    
-    ratio_cubic = args.cube_size * args.cube_size * args.cube_size / 262144
-    ratio_cubic = ratio_cubic/8.0
-    ratio_cubic = ratio_cubic * peak_memory_mb2/peak_memory_mb1
-
-    ratio_batch = args.mbsz / 2.0
-    ratio_batch = ratio_batch * peak_memory_mb3/peak_memory_mb1 
-    
-    logging.info(f"Peak GPU memory estimated is: {peak_memory_mb1*ratio_cubic*ratio_batch:.2f} MB")
-
-    return peak_memory_mb1*ratio_cubic*ratio_batch
-
-def evaluation(args, gts, preds, odir):
-    ssim_vals, psnr_vals, rmse_vals = [], [], []
-    #Calculate Test Metrics
-    for i in range(gts.shape[0]):
-        #SSIM Calc
-        img1 = preds[i]
-        img1 = (img1-img1.min()) / (img1.max()-img1.min()+1e-7)
-        img2 = gts[i]
-        img2 = (img2-img2.min()) / (img2.max()-img2.min()+1e-7)
-
-        #Crop out region outside sample
-        #l_x, l_y = img2.shape[0], img2.shape[1]
-        #X, Y = np.ogrid[:l_x, :l_y]
-        #outer_disk_mask = (X - l_x / 2) ** 2 + (Y - l_y / 2) ** 2 > (l_x / 2) ** 2
-        #[~outer_disk_mask]
-
-
-        dr = img2.max() - img2.min()
-        ssim_vals.append(ssim(img1, img2, data_range=dr))
-
-        #PSNR Calc
-        dr = img2.max() - img2.min()+1e-7
-        psnr_vals.append(psnr(img1, img2, data_range=dr))
-
-        #RMSE Calc
-        rmse = np.sqrt(((img1-img2)**2.).mean())
-        rmse_vals.append(rmse)
-
-        #Save a single image (runs faster)
-        if i == 525:
-            save2img(img1, f'{odir}/tiffs/pred/{i:05d}.tiff')
-
-        #Save output
-        #save2img(img1, f'{odir}/tiffs/pred/{i:05d}.tiff')
-        #save2img(img2, f'{odir}/tiffs/gt/{i:05d}.tiff')
-        #save2img(img1, f'{odir}/pngs/pred/{i:05d}.png')
-        #save2img(img2, f'{odir}/pngs/gt/{i:05d}.png')
-
-
-    ssim_vals = np.array(ssim_vals)
-    psnr_vals = np.array(psnr_vals)
-    rmse_vals = np.array(rmse_vals)
-
-    out_path = '/home/beams/WZHENG/3DN2I/CSVs/3D'
-    dosage_level = '50A_500I_Cube'
-    
-    results_df = pd.DataFrame({
-        'SSIM': ssim_vals,
-        'PSNR': psnr_vals,
-        'RMSE': rmse_vals,
-    })
-
-    return results_df
 
 # mains inference function
 def inference(args, model, odir, rank, num_processes, preds, gts, temp_X_buffer, temp_Y_buffer, barrier):
@@ -176,7 +86,7 @@ def inference(args, model, odir, rank, num_processes, preds, gts, temp_X_buffer,
     # Example: adjust the dimensions to match your actual input
     start_time = time.perf_counter()
 
-    mem_estimator(args, model)
+    # mem_estimator(args, model)
 
     torch.cuda.synchronize()
     elapsed_time = time.perf_counter() - start_time
