@@ -169,7 +169,7 @@ class TomoInferDatasetFoam3DCube_tiff(Dataset):
         load_time, cubify_time = 0, 0
         start_time = time.time()
 
-        path_to_tiffs_dir = path_to_tiffs_dir #+ '/'
+        path_to_tiffs_dir = path_to_tiffs_dir #+ '/'\
         all_files = tiffs.glob(path_to_tiffs_dir)
         total_files = len(all_files)
 

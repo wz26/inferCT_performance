@@ -22,8 +22,10 @@ def load_stack(paths, binning=1, use_tqdm=True):
 
     """
     # Read first image for shape and dtype information
+    print(paths)
     paths = list(paths)
 
+    print(paths)
     img0 = tifffile.imread(str(paths[0]))
     img0 = img0[::binning, ::binning]
     dtype = img0.dtype
@@ -53,7 +55,7 @@ def save_stack(path, stack, prefix="output", exist_ok=True, parents=False):
     path = Path(path).expanduser().resolve()
     path.mkdir(exist_ok=exist_ok, parents=parents)
     for i, s in tqdm(enumerate(stack), mininterval=10.0):
-        opath = path / f"{prefix}_{i:05d}.tif"
+        opath = path / f"{prefix}_{i:05d}.tiff"
         tifffile.imsave(str(opath), s)
 
 
@@ -68,7 +70,6 @@ def load_sino(paths, binning=1, dtype=None, flip_y=False):
     """
     # Read first image for shape and dtype information
     paths = list(paths)
-    #print(paths[0])
     #sys.exit()
     img0 = tifffile.imread(str(paths[0]))
     img0 = img0[::binning, ::binning]
