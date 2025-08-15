@@ -1,6 +1,6 @@
 # inferCT_performance
 
-## Commands to test the code
+## Commands to test the code, please change the data and model path as needed
 
 ### Original code: 
 ```shell
