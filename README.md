@@ -1,4 +1,4 @@
-# cikm_3DN2I_performance
+# inferCT_performance
 
 ## Commands to test the code
 
